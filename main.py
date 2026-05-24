@@ -7,12 +7,12 @@ from typing import Optional
 import aiohttp
 import winrt.windows.media.control as wmc
 
-DISCORD_TOKEN  = "YOUR_DISCORD_TOKEN"
-MAX_STATUS_LEN = 128
-TIME_OFFSET    = 2.0
+DISCORD_TOKEN  = "YOUR_DISCORD_USER_TOKEN"
+MAX_STATUS_LEN = 100
+TIME_OFFSET    = 1.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger("ym-discord")
+log = logging.getLogger("spotify-discord")
 
 lyrics_cache: dict[str, list[tuple[float, str]]] = {}
 
@@ -20,27 +20,26 @@ async def get_smtc_state() -> Optional[dict]:
     try:
         manager = await wmc.GlobalSystemMediaTransportControlsSessionManager.request_async()
 
-        # Ищем сессию Яндекс Музыки
-        ym_session = None
+        # look for Spotify session
+        sp_session = None
         for session in manager.get_sessions():
             app_id = (session.source_app_user_model_id or "").lower()
-            if "yandex" in app_id:
-                ym_session = session
+            if "spotify" in app_id:
+                sp_session = session
                 break
 
-        if ym_session is None:
-            return None  # Яндекс Музыка не запущена
+        if sp_session is None:
+            return None  # spotify not running
 
-        if ym_session is None:
+        if sp_session is None:
             return None
 
-        info     = await ym_session.try_get_media_properties_async()
-        timeline = ym_session.get_timeline_properties()
-        status   = int(ym_session.get_playback_info().playback_status)
+        info     = await sp_session.try_get_media_properties_async()
+        timeline = sp_session.get_timeline_properties()
+        status   = int(sp_session.get_playback_info().playback_status)
         playing  = status == 4  # 4=Playing, 5=Paused
 
         title = info.title or ""
-        # Пропускаем если это явно не музыка (видео из браузера обычно имеет длинное название)
         if not title:
             return None
 
@@ -91,7 +90,7 @@ async def get_lyrics(artist: str, title: str) -> list[tuple[float, str]]:
     cache_key = f"{artist}|{title}"
     if cache_key in lyrics_cache:
         return lyrics_cache[cache_key]
-    log.info(f"Ищу текст: {artist} — {title}")
+    log.info(f"Searching lyrics: {artist} — {title}")
     queries = [
         f"{artist} {title}",
         title,
@@ -101,10 +100,10 @@ async def get_lyrics(artist: str, title: str) -> list[tuple[float, str]]:
     for q in queries:
         lines = await search_lrclib(q)
         if lines:
-            log.info(f"lrclib: {len(lines)} строк")
+            log.info(f"lrclib: {len(lines)} lines")
             break
     if not lines:
-        log.warning("Текст не найден")
+        log.warning("Lyrics not found")
     lyrics_cache[cache_key] = lines
     return lines
 
@@ -124,7 +123,7 @@ class DiscordClient:
                 payload = {"custom_status": {"text": text, "emoji_name": "🎵"} if text else None}
                 async with session.patch(f"{self.API}/users/@me/settings", json=payload) as r:
                     if r.status == 200:
-                        log.info(f"Статус → {text!r}")
+                        log.info(f"Status → {text!r}")
                     else:
                         log.warning(f"Discord {r.status}")
         except Exception as e:
@@ -146,29 +145,29 @@ async def main():
     dc = DiscordClient(DISCORD_TOKEN)
     current_key: Optional[str] = None
     lines: list[tuple[float, str]] = []
-    none_count    = 0      # сколько раз подряд SMTC вернул None
-    paused_count  = 0      # сколько раз подряд позиция не двигалась
+    none_count    = 0      # consecutive None returns from SMTC
+    paused_count  = 0      # consecutive position not moving
     prev_position = -999.0
     base_position = 0.0
     base_time     = 0.0
 
-    log.info("Запуск — жду музыку...")
+    log.info("Started — waiting for music...")
 
     while True:
         state = await get_smtc_state()
 
         if state is None:
             none_count += 1
-            # Очищаем только если долго нет сессии (плеер закрыт)
+            # clear only if no session for long (player closed)
             if none_count >= 5 and current_key is not None:
-                log.info("Плеер закрыт — очищаю статус")
+                log.info("Player closed — clearing status")
                 current_key = None
                 lines = []
                 none_count = 0
                 paused_count = 0
                 prev_position = -999.0
                 await dc.clear_status()
-            # Продолжаем показывать текст по интерполяции
+            # continue showing interpolated lyrics
             if lines and current_key is not None:
                 elapsed = time.monotonic() - base_time
                 cur_pos = base_position + elapsed + TIME_OFFSET
@@ -184,9 +183,9 @@ async def main():
             playing  = state["playing"]
             key      = f"{artist}|{title}"
 
-            # Новый трек — сбрасываем всё
+            # new track - reset everything
             if key != current_key:
-                log.info(f"Новый трек: {artist} — {title}")
+                log.info(f"New track: {artist} — {title}")
                 current_key   = key
                 paused_count  = 0
                 prev_position = -999.0
@@ -194,31 +193,31 @@ async def main():
                 base_time     = time.monotonic()
                 lines = await get_lyrics(artist, title)
 
-            # Обновляем базу позиции если двигается
+            # update position base if moving
             if abs(position - prev_position) > 0.3:
                 base_position = position
                 base_time     = time.monotonic()
             prev_position = position
 
-            # Пауза — сразу по флагу
+            # pause - clear immediately
             if not playing:
                 if current_key is not None:
-                    log.info("Пауза — очищаю статус")
+                    log.info("Paused — clearing status")
                     current_key   = None
                     lines         = []
                     prev_position = -999.0
                     await dc.clear_status()
             else:
-                # Показываем текущую строку
+                # show current line
                 elapsed = time.monotonic() - base_time
                 cur_pos = base_position + elapsed + TIME_OFFSET
                 if lines:
                     line = get_current_line(lines, cur_pos)
                     if len(line) > MAX_STATUS_LEN:
                         line = line[:MAX_STATUS_LEN - 1] + "…"
-                    await dc.set_status(f"🎵 {line}")
+                    await dc.set_status(f" {line}")
                 else:
-                    await dc.set_status(f"🎵 {artist} — {title}")
+                    await dc.set_status(f" {artist} — {title}")
 
         await asyncio.sleep(2)
 
@@ -226,4 +225,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Остановлено.")
+        log.info("Stopped.")

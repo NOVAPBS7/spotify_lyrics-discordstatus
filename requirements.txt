@@ -1,2 +1,5 @@
-yandex-music>=2.0.0
-websockets>=12.0
+aiohttp
+winrt-runtime
+winrt-Windows.Media.Control
+winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections

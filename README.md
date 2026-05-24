@@ -1,4 +1,6 @@
-🎵 Yandex Music → Discord Status Lyrics
+Idea, Forked: https://github.com/Amnam01
+
+Spotify → Discord Status Lyrics
 
 Скрипт который синхронно показывает текст текущей песни из Яндекс Музыки в статусе Discord.
 
@@ -10,14 +12,14 @@
 
 - Windows 10/11
 - Python 3.12+
-- Приложение [Яндекс Музыка для Windows](https://music.yandex.ru/download)
+- Приложение [Spotify для Windows](https://spotify.com)
 - Discord (десктопное приложение)
 
 Установка
 
 1. Клонируй репозиторий:
 ```bash
-git clone https://github.com/ТВО_ИМЯ/yandex-discord-lyrics.git
+git clone https://github.com/NOVAPBS7/yandex-discord-lyrics.git
 cd yandex-discord-lyrics
 ```
 
@@ -48,18 +50,19 @@ DISCORD_TOKEN = "твой_токен_здесь"
 
 Как работает
 
-- Читает текущий трек через **Windows Media Session API** (SMTC) из приложения Яндекс Музыки
+- Читает текущий трек через **Windows Media Session API** (SMTC) из приложения Spotify
 - Загружает синхронизированный текст с **[lrclib.net](https://lrclib.net)** (бесплатно, без ключа)
-- Обновляет статус Discord через **HTTP API** каждые 2 секунды
+- Обновляет статус Discord через **HTTP API** каждую секунду
 - При паузе — статус очищается автоматически
 
 Зависимости
 
 ```
 aiohttp
-websockets
+winrt-runtime
 winrt-Windows.Media.Control
 winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections
 ```
 
 Ограничения
