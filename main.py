@@ -12,6 +12,7 @@ import aiohttp
 import winrt.windows.media.control as wmc
 import customtkinter as ctk
 from PIL import Image
+from pypresence import AioPresence  # new lib for rpc card
 
 # logic config
 MAX_STATUS_LEN = 100
@@ -87,7 +88,13 @@ async def get_lyrics(session: aiohttp.ClientSession, artist: str, title: str) ->
         lyrics_cache.move_to_end(cache_key)
         return lyrics_cache[cache_key]
 
-    queries = [f"{artist} {title}", title, f"{artist.split(',')[0].strip()} {title}"]
+    queries = []
+    if artist:
+        queries.append(f"{artist} {title}")
+        queries.append(f"{artist.split(',')[0].strip()} {title}")
+    queries.append(title)
+    queries = list(dict.fromkeys(queries))
+    
     lines = []
     for q in queries:
         lines = await search_lrclib(session, q)
@@ -108,10 +115,8 @@ class DiscordClient:
 
     async def set_status(self, text: str, emoji_name: str = "🎵", status_cb=None):
         if text == self._status_text and emoji_name == self._emoji: return
-        
         now = time.time()
-        if now < self.cooldown_until:
-            return
+        if now < self.cooldown_until: return
 
         self._status_text = text
         self._emoji = emoji_name
@@ -119,8 +124,7 @@ class DiscordClient:
             payload = {"custom_status": {"text": text, "emoji_name": emoji_name} if text else None}
             async with self.session.patch(f"{self.API}/users/@me/settings", json=payload) as r:
                 if r.status == 200:
-                    if status_cb and text:
-                        status_cb(f"{emoji_name} {text}")
+                    if status_cb and text: status_cb(f"Status: {emoji_name} {text}")
                 elif r.status == 429:
                     retry_after = 5.0
                     try:
@@ -128,13 +132,8 @@ class DiscordClient:
                         retry_after = res_json.get("retry_after", 5.0)
                     except Exception:
                         retry_after = float(r.headers.get("Retry-After", 5.0))
-                    
                     self.cooldown_until = time.time() + retry_after
                     log.warning(f"discord rate limit 429 cooling down for {retry_after}s")
-                elif r.status == 401:
-                    log.error("invalid discord token")
-                else: 
-                    log.warning(f"discord error http {r.status}")
         except Exception as e: log.warning(f"discord request failed {e}")
 
     async def clear_status(self): await self.set_status("", "")
@@ -148,13 +147,25 @@ def get_current_line(lines: list[tuple[float, str]], position: float) -> str:
     return current
 
 # main async loop
-async def status_loop(token: str, offset: float, mode: str, user_emoji: str, update_ui_callback, status_cb, stop_event: threading.Event):
+async def status_loop(client_id: str, token: str, offset: float, mode: str, user_emoji: str, update_ui_callback, status_cb, stop_event: threading.Event):
     log.info("starting status module")
-    dc = DiscordClient(token)
+    
+    dc = DiscordClient(token) if token else None
     lrc_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+    rpc = None
+    
+    # init rich presence
+    if client_id:
+        try:
+            rpc = AioPresence(client_id)
+            await rpc.connect()
+            log.info("connected to local Discord RPC (Rich Presence)")
+        except Exception as e:
+            log.warning(f"failed to connect to local Discord RPC: {e}")
+            rpc = None
+
     current_key, lines = None, []
     none_count, prev_position, base_position, base_time = 0, -999.0, 0.0, 0.0
-    
     last_discord_update = 0.0
 
     update_ui_callback("Waiting for music...", "gray")
@@ -166,53 +177,92 @@ async def status_loop(token: str, offset: float, mode: str, user_emoji: str, upd
                 if none_count >= 5 and current_key is not None:
                     log.info("spotify inactive clearing status")
                     current_key, lines = None, []
-                    await dc.clear_status()
+                    if dc: await dc.clear_status()
+                    if rpc: await rpc.clear()
                     update_ui_callback("Spotify closed / No music playing", "gray")
             else:
                 none_count = 0
-                artist, title, position, duration, playing = state["artist"], state["title"], state["position"], state["duration"], state["playing"]
+                artist, title = state["artist"], state["title"]
+                position, duration, playing = state["position"], state["duration"], state["playing"]
                 key = f"{artist}|{title}"
+                track_name = f"{artist} — {title}" if artist else title
 
-                if key != current_key:
-                    log.info(f"new track detected {artist} - {title}")
-                    current_key = key
-                    prev_position, base_position, base_time = -999.0, position, time.monotonic()
+                # track changed or seeked
+                if key != current_key or abs(position - prev_position) > 1.5:
+                    if key != current_key:
+                        log.info(f"new track detected: {track_name}")
+                        if dc and "Lyrics" in mode:
+                            update_ui_callback(f"Searching lyrics: {track_name}", "orange")
+                            lines = await get_lyrics(lrc_session, artist, title)
+                        else:
+                            lines = []
                     
-                    if mode == "Smart (Lyrics + Timer)":
-                        update_ui_callback(f"Searching lyrics: {artist} — {title}", "orange")
-                        lines = await get_lyrics(lrc_session, artist, title)
-                    else:
-                        lines = []
-
-                if abs(position - prev_position) > 0.5:
+                    current_key = key
                     base_position, base_time = position, time.monotonic()
+                    
+                    # update rpc card
+                    if rpc and playing:
+                        is_local_file = not artist  # no artist means local file
+                        if is_local_file:
+                            try:
+                                start_epoch = int(time.time() - position)
+                                end_epoch = start_epoch + int(duration)
+                                await rpc.update(
+                                    details=title[:128],
+                                    state="Local File",
+                                    start=start_epoch,
+                                    end=end_epoch,
+                                    large_image="spotify", # img from art assets
+                                    large_text="Spotify Local"
+                                )
+                                status_cb(f"RPC Card: {title} - {format_time(position)}/{format_time(duration)}")
+                            except Exception as e:
+                                log.warning(f"rpc update error: {e}")
+                        else:
+                            # clear custom rpc for normal tracks to allow native spotify integration
+                            try:
+                                await rpc.clear()
+                            except Exception:
+                                pass
+
                 prev_position = position
 
                 if not playing:
                     if current_key is not None:
                         log.info("player paused")
                         current_key, lines = None, []
-                        await dc.clear_status()
+                        if dc: await dc.clear_status()
+                        if rpc: await rpc.clear() # clear card on pause
                         update_ui_callback("Track paused", "gray")
                 else:
                     elapsed = time.monotonic() - base_time
                     now = time.time()
                     
-                    if lines:
-                        line = get_current_line(lines, base_position + elapsed + offset)
-                        if len(line) > MAX_STATUS_LEN: line = line[:MAX_STATUS_LEN - 1] + "…"
-                        await dc.set_status(line, user_emoji, status_cb)
-                        update_ui_callback(f"Streaming lyrics: {artist} — {title}", "#2ebd59")
-                    else:
-                        time_str = f"[{format_time(base_position + elapsed)} / {format_time(duration)}]"
-                        status_text = f"{artist} — {title} {time_str}"
-                        if len(status_text) > MAX_STATUS_LEN: status_text = f"{title} {time_str}"[:MAX_STATUS_LEN]
-                        
-                        if now - last_discord_update >= 8.0 or current_key != key:
-                            await dc.set_status(status_text, user_emoji, status_cb)
-                            last_discord_update = now
-                            
-                        update_ui_callback(f"Streaming timer: {artist} — {title}", "#2ebd59")
+                    # update custom status text
+                    if dc:
+                        if lines:
+                            line = get_current_line(lines, base_position + elapsed + offset)
+                            if len(line) > MAX_STATUS_LEN: line = line[:MAX_STATUS_LEN - 1] + "…"
+                            await dc.set_status(line, user_emoji, status_cb)
+                            update_ui_callback(f"Streaming lyrics: {track_name}", "#2ebd59")
+                        else:
+                            if mode == "Smart (Lyrics Only)":
+                                status_text = track_name[:MAX_STATUS_LEN]
+                                if now - last_discord_update >= 8.0:
+                                    await dc.set_status(status_text, user_emoji, status_cb)
+                                    last_discord_update = now
+                                update_ui_callback(f"Streaming title: {track_name}", "#2ebd59")
+                            else:
+                                time_str = f"[{format_time(base_position + elapsed)} / {format_time(duration)}]"
+                                status_text = f"{track_name} {time_str}"
+                                if len(status_text) > MAX_STATUS_LEN:
+                                    avail = MAX_STATUS_LEN - len(time_str) - 2
+                                    status_text = f"{track_name[:avail]}… {time_str}" if avail > 0 else track_name[:MAX_STATUS_LEN]
+                                
+                                if now - last_discord_update >= 8.0:
+                                    await dc.set_status(status_text, user_emoji, status_cb)
+                                    last_discord_update = now
+                                update_ui_callback(f"Streaming timer: {track_name}", "#2ebd59")
 
             await asyncio.sleep(1.0)
     except Exception as e:
@@ -220,8 +270,12 @@ async def status_loop(token: str, offset: float, mode: str, user_emoji: str, upd
         update_ui_callback(f"Error: {e}", "red")
     finally:
         log.info("status module stopped")
-        await dc.clear_status()
-        await dc.close()
+        if dc:
+            await dc.clear_status()
+            await dc.close()
+        if rpc: 
+            await rpc.clear()
+            rpc.close()
         await lrc_session.close()
 
 # console log handler
@@ -241,7 +295,7 @@ class App(ctk.CTk):
         super().__init__()
         
         self.title("Spotify Status for Discord")
-        self.geometry("760x590")
+        self.geometry("760x650")
         self.resizable(False, False)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
@@ -252,8 +306,6 @@ class App(ctk.CTk):
                 if os.path.exists(icon_path):
                     from PIL import ImageTk, Image
                     raw_icon = Image.open(icon_path)
-                    
-                    # Сжимаем качественно (LANCZOS), чтобы Tkinter не сделал "мыло"
                     raw_icon = raw_icon.resize((32, 32), Image.Resampling.LANCZOS)
                     self.window_icon = ImageTk.PhotoImage(raw_icon)
                     self.wm_iconphoto(False, self.window_icon)
@@ -261,7 +313,6 @@ class App(ctk.CTk):
                 log.warning(f"failed to load window icon: {e}")
         
         self.after(500, set_icon)
-
 
         self.async_thread = None
         self.stop_event = threading.Event()
@@ -273,53 +324,43 @@ class App(ctk.CTk):
             image_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "img", "banneroff.png")
             if os.path.exists(image_path):
                 raw_img = Image.open(image_path).convert("RGBA")
-                
                 alpha = raw_img.split()[3]
                 alpha = alpha.point(lambda p: int(p * 0.7))
                 raw_img.putalpha(alpha)
-                
                 orig_w, orig_h = raw_img.size
                 target_h = 24 
                 target_w = int(orig_w * (target_h / orig_h))
-                
                 loaded_img = ctk.CTkImage(light_image=raw_img, dark_image=raw_img, size=(target_w, target_h))
                 
                 self.creator_text = ctk.CTkLabel(self.creator_frame, text="Created by", font=ctk.CTkFont(size=11, slant="italic"), text_color="#777777")
                 self.creator_text.pack(side="left", padx=(0, 4)) 
-                
                 self.creator_img = ctk.CTkLabel(self.creator_frame, text="", image=loaded_img)
                 self.creator_img.pack(side="left")
             else:
                 self.creator_label = ctk.CTkLabel(self.creator_frame, text="Created by NOVAPBS", font=ctk.CTkFont(size=11, slant="italic"), text_color="#777777")
                 self.creator_label.pack(side="left")
-                
-        except Exception as e:
-            log.warning(f"failed to load banner image: {e}")
+        except Exception: pass
         
         # header
         self.label_title = ctk.CTkLabel(self, text="Spotify ➔ Discord Status", font=ctk.CTkFont(size=20, weight="bold"))
         self.label_title.pack(pady=(15, 10))
         
-        # token widgets
-        self.token_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.token_frame.pack(pady=5)
-        self.token_entry = ctk.CTkEntry(self.token_frame, placeholder_text="Enter Discord Token...", width=270, show="*")
-        self.token_entry.pack(side="left", padx=(0, 5))
-        self.btn_paste = ctk.CTkButton(self.token_frame, text="Paste", width=75, fg_color="#333333", hover_color="#444444", command=self.paste_from_clipboard)
-        self.btn_paste.pack(side="left")
+        # auth widgets
+        self.auth_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.auth_frame.pack(pady=5)
+        
+        self.client_id_entry = ctk.CTkEntry(self.auth_frame, placeholder_text="Discord Client ID (Для большой карточки RPC)", width=350)
+        self.client_id_entry.pack(pady=(0, 5))
 
-        # hotkeys
-        for key in ["<Control-v>", "<Control-V>", "<Control-Cyrillic_em>", "<Control-Cyrillic_EM>"]:
-            self.token_entry.bind(key, self.hook_paste)
-        for key in ["<Control-a>", "<Control-A>", "<Control-Cyrillic_ef>", "<Control-Cyrillic_EF>"]:
-            self.token_entry.bind(key, self.hook_select_all)
+        self.token_entry = ctk.CTkEntry(self.auth_frame, placeholder_text="Discord Token (Для текстов песен под ником)", width=350, show="*")
+        self.token_entry.pack(pady=(0, 5))
 
         # display mode
         self.mode_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.mode_frame.pack(pady=5, fill="x", padx=200)
         self.mode_label = ctk.CTkLabel(self.mode_frame, text="Display Mode:")
         self.mode_label.pack(side="left")
-        self.mode_select = ctk.CTkOptionMenu(self.mode_frame, values=["Smart (Lyrics + Timer)", "Title + Timer Only"], width=190)
+        self.mode_select = ctk.CTkOptionMenu(self.mode_frame, values=["Smart (Lyrics + Timer)", "Smart (Lyrics Only)", "Title + Timer Only"], width=190)
         self.mode_select.pack(side="right")
 
         # custom emoji
@@ -338,7 +379,7 @@ class App(ctk.CTk):
         self.offset_slider.set(0.8)
         self.offset_slider.pack(pady=5)
 
-        # main execution button
+        # main exec button
         self.btn_toggle = ctk.CTkButton(self, text="Start Status", font=ctk.CTkFont(weight="bold", size=14), fg_color="#2ebd59", hover_color="#1ed760", command=self.toggle_script)
         self.btn_toggle.pack(pady=15)
 
@@ -346,11 +387,10 @@ class App(ctk.CTk):
         self.status_label = ctk.CTkLabel(self, text="Status: Disabled", text_color="gray", font=ctk.CTkFont(size=12))
         self.status_label.pack(pady=5)
 
-        # side by side console container frame
+        # consoles
         self.consoles_container = ctk.CTkFrame(self, fg_color="transparent")
         self.consoles_container.pack(fill="both", expand=True, padx=15, pady=(0, 15), side="bottom")
 
-        # left console system events
         self.left_frame = ctk.CTkFrame(self.consoles_container, fg_color="transparent")
         self.left_frame.pack(side="left", fill="both", expand=True, padx=(0, 7))
         self.left_label = ctk.CTkLabel(self.left_frame, text="System Log", font=ctk.CTkFont(size=11, weight="bold"), text_color="gray")
@@ -358,10 +398,9 @@ class App(ctk.CTk):
         self.console = ctk.CTkTextbox(self.left_frame, font=ctk.CTkFont(family="Consolas", size=11), fg_color="#1e1e1e", text_color="#cccccc", state="disabled")
         self.console.pack(fill="both", expand=True)
 
-        # right console status output
         self.right_frame = ctk.CTkFrame(self.consoles_container, fg_color="transparent")
         self.right_frame.pack(side="right", fill="both", expand=True, padx=(7, 0))
-        self.right_label = ctk.CTkLabel(self.right_frame, text="Discord Custom Status Output", font=ctk.CTkFont(size=11, weight="bold"), text_color="#2ebd59")
+        self.right_label = ctk.CTkLabel(self.right_frame, text="Discord Output", font=ctk.CTkFont(size=11, weight="bold"), text_color="#2ebd59")
         self.right_label.pack(anchor="w")
         self.status_console = ctk.CTkTextbox(self.right_frame, font=ctk.CTkFont(family="Consolas", size=11), fg_color="#141414", text_color="#2ebd59", state="disabled")
         self.status_console.pack(fill="both", expand=True)
@@ -387,24 +426,6 @@ class App(ctk.CTk):
             self.status_console.configure(state="disabled")
         self.after(0, update)
 
-    def paste_from_clipboard(self):
-        try:
-            self.token_entry.delete(0, ctk.END)
-            self.token_entry.insert(0, self.clipboard_get())
-        except Exception: pass
-
-    def hook_paste(self, event=None):
-        try:
-            if self.token_entry.select_present(): self.token_entry.delete("sel.first", "sel.last")
-            self.token_entry.insert(ctk.INSERT, self.clipboard_get())
-        except Exception: pass
-        return "break"
-
-    def hook_select_all(self, event=None):
-        self.token_entry.select_range(0, ctk.END)
-        self.token_entry.icursor(ctk.END)
-        return "break"
-
     def update_slider_label(self, val):
         self.slider_label.configure(text=f"Lyrics Offset: {val:.1f} sec")
 
@@ -413,6 +434,7 @@ class App(ctk.CTk):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     config = json.load(f)
+                    self.client_id_entry.insert(0, config.get("client_id", ""))
                     self.token_entry.insert(0, config.get("token", ""))
                     loaded_offset = config.get("offset", 0.8)
                     self.offset_slider.set(loaded_offset)
@@ -427,6 +449,7 @@ class App(ctk.CTk):
     def save_config(self):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump({
+                "client_id": self.client_id_entry.get().strip(),
                 "token": self.token_entry.get().strip(), 
                 "offset": self.offset_slider.get(),
                 "mode": self.mode_select.get(),
@@ -446,26 +469,29 @@ class App(ctk.CTk):
                 self.update_status_ui("Status: Disabled", "gray")
             threading.Thread(target=wait_for_stop, daemon=True).start()
         else:
+            client_id = self.client_id_entry.get().strip()
             token = self.token_entry.get().strip()
-            if not token:
-                self.update_status_ui("Error: Token required", "red")
+            
+            if not client_id and not token:
+                self.update_status_ui("Error: Provide Token or Client ID", "red")
                 return
+                
             self.save_config()
             self.stop_event.clear()
             self.btn_toggle.configure(text="Stop Status", fg_color="#e91e63", hover_color="#c2185b")
             
             self.async_thread = threading.Thread(
                 target=self.run_async, 
-                args=(token, self.offset_slider.get(), self.mode_select.get(), self.emoji_entry.get().strip() or "🎵"), 
+                args=(client_id, token, self.offset_slider.get(), self.mode_select.get(), self.emoji_entry.get().strip() or "🎵"), 
                 daemon=True
             )
             self.async_thread.start()
 
-    def run_async(self, token, offset, mode, emoji):
+    def run_async(self, client_id, token, offset, mode, emoji):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(status_loop(token, offset, mode, emoji, self.update_status_ui, self.append_to_status_console, self.stop_event))
+            loop.run_until_complete(status_loop(client_id, token, offset, mode, emoji, self.update_status_ui, self.append_to_status_console, self.stop_event))
         finally:
             loop.close()
 
